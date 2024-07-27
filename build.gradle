@@ -21,11 +21,24 @@ test {
 }
 
 application {
-    mainClass = 'org.example.Main'
+    mainClassName = 'org.example.Main'
+    applicationDefaultJvmArgs = [
+            "-Xmx4G",
+            "-XX:+HeapDumpOnOutOfMemoryError",
+            "-XX:HeapDumpPath=./heapdumps"
+    ]
+}
+
+tasks.withType(JavaExec) {
+    jvmArgs = [
+            "-Xmx4G",
+            "-XX:+HeapDumpOnOutOfMemoryError",
+            "-XX:HeapDumpPath=./heapdumps"
+    ]
 }
 
 jar {
     manifest {
-        attributes 'Main-Class': 'org.example.BankApplication'
+        attributes 'Main-Class': 'org.example.Main'
     }
 }

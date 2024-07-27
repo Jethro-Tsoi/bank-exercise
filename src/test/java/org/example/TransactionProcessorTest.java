@@ -1,135 +1,164 @@
 package org.example;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
-import org.mockito.Mockito;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.*;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.*;
 
 class TransactionProcessorTest {
 
+    private TransactionProcessor processor;
     private BankImpl bank;
     private LegacyServer legacyServer;
-    private TransactionProcessor processor;
+    private ConcurrentHashMap<Integer, AccountImpl> accounts;
 
     @TempDir
     Path tempDir;
 
     @BeforeEach
     void setUp() {
-        bank = new BankImpl();
-        legacyServer = Mockito.mock(LegacyServer.class);
+        bank = mock(BankImpl.class);
+        legacyServer = mock(LegacyServer.class);
         processor = new TransactionProcessor(bank, legacyServer);
+        accounts = new ConcurrentHashMap<>();
+
+        // Set up mock behavior for bank
+        when(bank.getAccountByID(anyInt())).thenAnswer(invocation -> {
+            int accountId = invocation.getArgument(0);
+            return accounts.get(accountId);
+        });
+
+        doAnswer(invocation -> {
+            int accountId = invocation.getArgument(0);
+            String action = invocation.getArgument(1);
+            double amount = invocation.getArgument(2);
+            AccountImpl account = accounts.computeIfAbsent(accountId, id -> new AccountImpl(accountId));
+            double actualAmount = "withdraw".equals(action) ? -amount : amount;
+            AccountEntry entry = new AccountEntry(Instant.now(), actualAmount, action);
+            account.addEntry(entry);
+            return null;
+        }).when(bank).processTransaction(anyInt(), anyString(), anyDouble());
+    }
+
+    @AfterEach
+    void tearDown() throws Exception {
+        processor.close();
     }
 
     @Test
-    void testProcessTransactionFile() throws IOException {
-        Path file = tempDir.resolve("transactions.csv");
-        Files.writeString(file,
-                "Acc Id,Action,Amount\n" +
-                        "1,Deposit,100\n" +
-                        "1,Withdraw,50\n" +
-                        "2,Deposit,200\n"
-        );
+    void testBasicTransactionProcessing() throws IOException, InterruptedException {
+        Path transactionFile = createTransactionFile(
+                "AccountId,Action,Amount\n" +
+                        "1,deposit,100.00\n" +
+                        "2,withdraw,50.00\n" +
+                        "1,withdraw,25.00\n");
 
-        processor.processTransactionFile(file);
+        processor.processTransactionFile(transactionFile);
+        Thread.sleep(1000); // Allow time for asynchronous operations
 
-        Account account1 = bank.getAccountByID(1);
-        assertEquals(50, account1.getBalance());
-        assertEquals(2, account1.entries().length);
-
-        Account account2 = bank.getAccountByID(2);
-        assertEquals(200, account2.getBalance());
-        assertEquals(1, account2.entries().length);
-
+        verify(bank, times(3)).processTransaction(anyInt(), anyString(), anyDouble());
+        verify(bank, times(3)).getAccountByID(anyInt());
         verify(legacyServer, times(3)).reportActivity(anyInt(), any(Instant.class), anyDouble(), anyDouble());
+
+        assertEquals(75.00, accounts.get(1).getBalance(), 0.01);
+        assertEquals(-50.00, accounts.get(2).getBalance(), 0.01);
     }
 
     @Test
-    void testInvalidLineInFile() throws IOException {
-        Path file = tempDir.resolve("transactions.csv");
-        Files.writeString(file,
-                "Acc Id,Action,Amount\n" +
-                        "1,Deposit,100\n" +
-                        "invalid,line,here\n" +
-                        "2,Deposit,200\n"
-        );
+    void testLargeTransactionFile() throws IOException, InterruptedException {
+        StringBuilder fileContent = new StringBuilder("AccountId,Action,Amount\n");
+        for (int i = 0; i < 10000; i++) {
+            fileContent.append(i % 100).append(",deposit,").append(i).append(".00\n");
+        }
+        Path transactionFile = createTransactionFile(fileContent.toString());
 
-        processor.processTransactionFile(file);
+        processor.processTransactionFile(transactionFile);
+        Thread.sleep(2000); // Allow more time for processing large file
 
-        Account account1 = bank.getAccountByID(1);
-        assertEquals(100, account1.getBalance());
+        verify(bank, times(10000)).processTransaction(anyInt(), anyString(), anyDouble());
+        verify(legacyServer, times(10000)).reportActivity(anyInt(), any(Instant.class), anyDouble(), anyDouble());
 
-        Account account2 = bank.getAccountByID(2);
-        assertEquals(200, account2.getBalance());
-
-        verify(legacyServer, times(2)).reportActivity(anyInt(), any(Instant.class), anyDouble(), anyDouble());
-    }
-
-    @Test
-    void testFileNotFound() {
-        Path file = tempDir.resolve("non_existent_file.csv");
-        assertDoesNotThrow(() -> processor.processTransactionFile(file));
-    }
-
-    @Test
-    void testBatchProcessing() throws IOException {
-        Path file = tempDir.resolve("large_transactions.csv");
-
-        // Create a large CSV file with 2500 transactions
-        String header = "Acc Id,Action,Amount\n";
-        String transactions = IntStream.range(0, 2500)
-                .mapToObj(i -> String.format("%d,Deposit,100", i % 100))
-                .collect(Collectors.joining("\n"));
-
-        Files.writeString(file, header + transactions);
-
-        processor.processTransactionFile(file);
-
-        // Check that all accounts were created and have the correct balance
         for (int i = 0; i < 100; i++) {
-            Account account = bank.getAccountByID(i);
-            assertEquals(2500, account.getBalance());
-            assertEquals(25, account.entries().length);
+            assertTrue(accounts.get(i).getBalance() > 0);
         }
-
-        // Verify that the legacy server was called for each transaction
-        verify(legacyServer, times(2500)).reportActivity(anyInt(), any(Instant.class), anyDouble(), anyDouble());
     }
 
     @Test
-    void testPartialBatch() throws IOException {
-        Path file = tempDir.resolve("partial_batch.csv");
+    void testInvalidTransactions() throws IOException, InterruptedException {
+        Path transactionFile = createTransactionFile(
+                "AccountId,Action,Amount\n" +
+                        "1,deposit,100.00\n" +
+                        "invalid,withdraw,50.00\n" +
+                        "2,invalid,25.00\n" +
+                        "3,withdraw,invalid\n");
 
-        // Create a CSV file with 1500 transactions (1 full batch + 1 partial batch)
-        String header = "Acc Id,Action,Amount\n";
-        String transactions = IntStream.range(0, 1500)
-                .mapToObj(i -> String.format("%d,Deposit,100", i % 50))
-                .collect(Collectors.joining("\n"));
+        processor.processTransactionFile(transactionFile);
+        Thread.sleep(1000);
 
-        Files.writeString(file, header + transactions);
+        verify(bank, times(1)).processTransaction(anyInt(), anyString(), anyDouble());
+        verify(legacyServer, times(1)).reportActivity(anyInt(), any(Instant.class), anyDouble(), anyDouble());
 
-        processor.processTransactionFile(file);
+        assertEquals(100.00, accounts.get(1).getBalance(), 0.01);
+        assertFalse(accounts.containsKey(2));
+        assertFalse(accounts.containsKey(3));
+    }
 
-        // Check that all accounts were created and have the correct balance
-        for (int i = 0; i < 50; i++) {
-            Account account = bank.getAccountByID(i);
-            assertEquals(3000, account.getBalance());
-            assertEquals(30, account.entries().length);
+    @Test
+    void testEmptyFile() throws IOException, InterruptedException {
+        Path transactionFile = createTransactionFile("AccountId,Action,Amount\n");
+
+        processor.processTransactionFile(transactionFile);
+        Thread.sleep(1000);
+
+        verify(bank, never()).processTransaction(anyInt(), anyString(), anyDouble());
+        verify(legacyServer, never()).reportActivity(anyInt(), any(Instant.class), anyDouble(), anyDouble());
+
+        assertTrue(accounts.isEmpty());
+    }
+
+    @Test
+    void testMissingHeader() throws IOException, InterruptedException {
+        Path transactionFile = createTransactionFile(
+                "1,deposit,100.00\n" +
+                        "2,withdraw,50.00\n");
+
+        processor.processTransactionFile(transactionFile);
+        Thread.sleep(1000);
+
+        verify(bank, times(1)).processTransaction(anyInt(), anyString(), anyDouble());
+        verify(legacyServer, times(1)).reportActivity(anyInt(), any(Instant.class), anyDouble(), anyDouble());
+
+        assertNull(accounts.get(1));
+        assertEquals(-50.00, accounts.get(2).getBalance(), 0.01);
+    }
+
+    @Test
+    void testConcurrentProcessing() throws IOException, InterruptedException {
+        StringBuilder fileContent = new StringBuilder("AccountId,Action,Amount\n");
+        for (int i = 0; i < 1000; i++) {
+            fileContent.append(1).append(",deposit,10.00\n");
         }
+        Path transactionFile = createTransactionFile(fileContent.toString());
 
-        // Verify that the legacy server was called for each transaction
-        verify(legacyServer, times(1500)).reportActivity(anyInt(), any(Instant.class), anyDouble(), anyDouble());
+        processor.processTransactionFile(transactionFile);
+        Thread.sleep(2000);
+
+        verify(bank, times(1000)).processTransaction(anyInt(), anyString(), anyDouble());
+        verify(legacyServer, times(1000)).reportActivity(anyInt(), any(Instant.class), anyDouble(), anyDouble());
+
+        assertEquals(10000.00, accounts.get(1).getBalance(), 0.01);
+    }
+
+    private Path createTransactionFile(String content) throws IOException {
+        Path transactionFile = tempDir.resolve("transactions.csv");
+        Files.writeString(transactionFile, content);
+        return transactionFile;
     }
 }

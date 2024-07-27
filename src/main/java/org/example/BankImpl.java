@@ -23,7 +23,7 @@ public class BankImpl implements Bank {
 
     public void processTransaction(int accountId, String action, double amount) {
         AccountImpl account = (AccountImpl) getAccountByID(accountId);
-        double actualAmount = "withdraw".equals(action) ? -amount : amount;
+        double actualAmount = "withdraw".equalsIgnoreCase(action) ? -amount : amount;
         AccountEntry entry = new AccountEntry(Instant.now(), actualAmount, action);
         account.addEntry(entry);
         LOGGER.info(String.format("Processed transaction for account %d: %s %.2f", accountId, action, amount));
